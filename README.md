@@ -5,4 +5,4 @@ El repositorio contiene los siguientes archivos:
 - properties.csv: *dataset* de propiedades inmobiliarias.
 - descriptions.csv: compilación de descripciones textuales a integrar
 - compile_descriptions.sh: *script* bash de compilación de las descripciones textuales
-- ES.txt
+- ES.txt: *dataset* para España de la BDD Geonames para integrar
