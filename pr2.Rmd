@@ -1,0 +1,338 @@
+---
+title: "Práctica 2 de Visualización de Datos"
+author: "José María Tagarro Martí"
+date: "2024-06-16"
+output:
+  html_document:
+    toc: false
+    df_print: paged
+  pdf_document:
+    toc: false
+    number_sections: true
+lang: "es-ES"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyr)
+library(purrr)
+library(dplyr)
+library(kableExtra)
+library(readr)
+library(ggplot2)
+library(GGally)
+library(arules)
+library(scales)
+library(caret)
+library(tidyverse)
+library(cluster)
+library(xfun)
+library(factoextra)
+library(foreach)
+library(fuzzyjoin)
+```
+
+# Preprocesado
+
+## Carga de los datos
+
+Se cargan los datos y se incluyen las columnas informadas en Zenodo como cabeceras: https://doi.org/10.5281/zenodo.10962212
+
+```{r echo=FALSE}
+# Carga de datos
+data <- read.csv("./properties.csv", header = FALSE)
+# Añadimos las cabeceras ya que no forman parte del CSV
+names(data) <- c("ref", "location", "price", "title", "bed", "bath", "built_area", "plot_area", "features")
+```
+
+A continuación se examina una muestra de 5 instancias de los primeros 4 atributos:
+
+```{r echo=FALSE}
+head(data[1:4], 5)
+```
+
+Y los restantes:
+
+```{r echo=FALSE}
+head(data[5:8], 5)
+```
+
+Y el contenido del atributo *features*:
+
+```{r echo=FALSE}
+print(stringr::str_trunc(data[1,9], 80))
+```
+
+## Limpieza
+
+Adaptamos el atributo `precio` para eliminar los separadores de miles y el símbolo de euro y poder tratarlo como valor numérico:
+
+```{r}
+data$price <- parse_number(data$price)
+```
+
+Y verificamos que se ha transformado correctamente:
+
+```{r echo=FALSE}
+data$price[1:5]
+```
+
+Dado que el *dataset* menciona el sitio web del que se capturaron los datos, hemos extraído de su buscador los tipos de propiedad disponibles para localizarlos dentro del campo `title` y poder obtener así el tipo de cada propiedad aunque no se capturase correctamente en su momento. 
+
+```{r}
+valid_types <- c("Apartment", "Bar / Nightclub", "Bungalow", "Cafe", "Cave House",
+                 "Commercial Development", "Commercial Property", "Detached",
+                 "Detached Villa", "Duplex", "Equestrian Facility", "Farm", "Finca",
+                 "Garage", "Ground Flat", "Guest House", "BedBreakfast", "House",
+                 "Land", "Office", "Other", "Parking", "Penthouse", "Plot", "Property",
+                 "Residential Building", "Restaurant", "Semi-detached", "Sheltered",
+                 "Housing", "Shop", "Storage", "Studio", "Town House", "Warehouse")
+# Función auxiliar para comparar un valor contra un array de valores
+replace_with_match <- function(value, strings_to_match) {
+  for (string in strings_to_match) {
+    if (grepl(string, value)) {
+      return(string)
+    }
+  }
+  return(value)
+}
+
+# Guardamos el valor en un nuevo atributo "type"
+data <- data %>%
+  mutate(type = sapply(title, replace_with_match, valid_types))
+
+# Lo hacemos factor
+data$type <- as.factor(data$type)
+```
+
+Ahora podemos prescindir del atributo `title` ya que contiene una combinación del número de habitaciones y del tipo de propiedad que acabamos de añadir:
+
+```{r}
+data <- data %>% select(-title)
+```
+
+El atributo *location* incluye en la mayoría de instancias la cadena "Costa del Sol" posiblemente por razones de optimización de posicionamiento en buscadores. Vamos a comprobar los distintos valores que aparecen tras la coma en esta columna:
+
+```{r}
+split_strings <- strsplit(data$location, ",")
+before_comma <- sapply(split_strings, `[`,1)
+after_comma <- sapply(split_strings, `[`,2)
+unique(after_comma)
+```
+
+Dado que todas las localizaciones pertenecen a la provincia de Málaga y Cádiz podemos eliminar las partes tras la coma de la localización y convertir la columna en factor:
+
+```{r}
+data$location <- as.factor(before_comma)
+```
+
+## Duplicados
+
+Verificamos si hay filas duplicadas:
+
+```{r}
+length(data[duplicated(data), ])
+```
+
+Hay 9 asi que se eliminan:
+
+```{r}
+data <- data[!duplicated(data), ]
+```
+
+
+## Valores faltantes
+
+Examinamos los NA por atributo:
+
+```{r}
+colSums(is.na(data))
+```
+
+Imputamos a 0 los atributos numéricos faltantes:
+
+```{r}
+data[is.na(data)] <- 0
+```
+
+Eliminamos las propiedades que no tienen al menos una habitación y al menos un baño, ya que el objetivo de la visualización son las viviendas:
+
+```{r}
+data <- data[data$bed > 0 & data$bath > 0, ]
+```
+
+## Valores atípicos
+
+Buscamos
+
+```{r}
+summary(data)
+```
+
+Vemos que los dormitorios llegan a más de 9 millones y los baños a más de 4 millones. Estos valores extremos van a comprimir demasiado el boxplot por lo que para determinar el umbral máximo que consideraremos normal truncamos inicialmente los datos por encima de 50:
+
+```{r}
+trimmed_bed <- data$bed[data$bed < 50]
+outliers_bed <- boxplot(trimmed_bed, plot=FALSE)
+min(outliers_bed$out)
+```
+
+Obtenemos que por tanto a partir de 8 lo consideramos ya un valor extremo. Análogamente para `bath`:
+
+```{r}
+trimmed_bath <- data$bath[data$bath < 50]
+outliers_bath <- boxplot(trimmed_bath, plot=FALSE)
+min(outliers_bath$out[outliers_bath$out>0])
+```
+
+Para `bath` vemos que el umbral está en 5. Con esta información aplicamos las siguientes correcciones:
+- Si el tipo de propiedad no es residencial y hay más de 8 habitaciones y `built_area` es 0, asumimos que es un valor de `built_area`.
+- Si el tipo de propiedad no es residencial y hay más de 5 baños y `built_area` es 0, asumimos que es un valor de `built_area`.
+- Si el número de baños es mayor de 50 y `built_area` es 0, con independencia del tipo de propiedad, asumimos que se trata de `built_area`.
+
+```{r}
+non_residential_types <- c("Bar / Nightclub", "Cafe", "Commercial Development",
+                           "Commercial Property", "Equestrian Facility", "Farm",
+                           "Finca", "Garage", "Land", "Office", "Other", "Parking",
+                           "Plot", "Residential Building", "Restaurant", "Shop",
+                           "Storage", "Warehouse", "Hospitality", "Guest House",
+                           "Property")
+
+# If property type is not residential and built_area is empty and there are more
+# than 8 bed, we assume it is built_area
+data <- data %>%
+  mutate(built_area = ifelse(as.factor(type) %in% non_residential_types &
+                                built_area == 0 & bed > 8, bed , built_area))
+data <- data %>%
+  mutate(bed = ifelse(as.factor(type) %in% non_residential_types &
+                                built_area == bed, 0 , bed))
+
+# If property type is not residential and built_area is empty and there are more
+# than 8 bath, we assume it is built_area
+data <- data %>%
+  mutate(built_area = ifelse(as.factor(type) %in% non_residential_types &
+                                built_area == 0 & bath > 5, bath , built_area))
+data <- data %>%
+  mutate(bath = ifelse(as.factor(type) %in% non_residential_types &
+                                built_area == bath, 0 , bath))
+
+# If property type is not residential and built_area is not empty and plot_area
+# is empty and there are more than 8 bath, we assume it is plot_area
+data <- data %>%
+  mutate(plot_area = ifelse(as.factor(type) %in% non_residential_types &
+                                built_area != 0 & plot_area ==0 & bath > 5,
+                             bath , plot_area))
+data <- data %>%
+  mutate(bath = ifelse(as.factor(type) %in% non_residential_types &
+                                built_area != 0 & plot_area == bath, 0, bath))
+
+# If there are more than 50 baths and built_area is empty, regardless of property type
+data <- data %>%
+  mutate(built_area = ifelse(built_area == 0 & bath > 50, bath , built_area))
+data <- data %>%
+  mutate(bath = ifelse(built_area == bath & bath > 50, 0 , bath))
+
+```
+
+## Integración
+
+### Descripciones textuales
+
+Mediante el *script* de *bash* *compile_descriptions.sh* convertimos a CSV los ficheros que contienen las descripciones textuales en inglés de las propiedades:
+- Eliminamos signos de puntuación.
+- Convertimos cualquier secuencia de caracteres de espacio o nueva línea en un solo espacio en blanco.
+- La referencia pasa a ser el primer atributo del CSV y la descripción el segundo.
+
+Cargamos el resultado:
+
+```{r}
+# Carga de descripciones textuales
+descriptions <- read.csv("./descriptions.csv", header = TRUE)
+# Remove first line that is NA
+descriptions = descriptions[-1,]
+```
+
+Añadimos la descripción al *dataset* principal, eliminando las filas que no tengan descripción para tener un *dataset* completo:
+
+```{r}
+data <- merge(data, descriptions, by = "ref", all.x = TRUE)
+```
+
+Nos quedamos con los que tengan tanto descripción como características:
+
+```{r}
+data <- data[data$features != "", ]
+data <- data[data$description != "", ]
+```
+
+### Latitud y longitud
+
+Reemplazamos `location` por su latitud y longitud y se elimina también la referencia:
+
+```{r}
+# Load the file with the geonames DB for Spain
+read.csv(
+  file = "ES.txt",
+  header = FALSE,
+  sep = "\t",
+  col.names = c(
+    "geonameid", "name", "asciiname", "alternatenames", "latitude",
+    "longitude", "feature_class", "feature_code", "country", "cc2",
+    "admin1_code1", "admin2_code", "admin3_code", "admin4_code",
+    "population", "elevation", "dem", "timezone", "modification_date"),
+  stringsAsFactors = FALSE
+) %>% tibble::as_tibble() -> es_geo
+
+# Keep data from Cadiz and Malaga provinces
+ma_ca_geo <- es_geo %>%
+  filter(admin2_code=="MA" | admin2_code=="CA")
+
+merged_df <- data %>%
+  stringdist_left_join(ma_ca_geo, by = c(location = "name"), max_dist = 3, ignore_case=TRUE)
+to_remove <- c(
+    "geonameid", "name", "asciiname", "alternatenames", "feature_class",
+    "feature_code", "country", "cc2", "admin1_code1", "admin2_code",
+    "admin3_code", "admin4_code", "population", "elevation", "dem",
+    "timezone", "modification_date")
+data <- merged_df[, !(names(merged_df) %in% to_remove)]
+data <- data[!duplicated(data$ref), ]
+data$location <- NULL
+#data$ref <- NULL
+```
+
+Finalmente, eliminamos las instancias que no tienen latitud o longitud ya que son atributos que por su naturaleza no pueden imputarse pero cuya presencia parece importante para estimar el precio de una propiedad inmobiliaria:
+
+```{r}
+data <- data[!is.na(data$latitude), ]
+data <- data[!is.na(data$longitude), ]
+```
+
+Eliminamos la referencia:
+
+```{r}
+data$ref <- NULL
+```
+
+# Análisis de los datos
+
+
+
+Se aprecia una buena separación entre los centros de los clústeres en esta visualización de sus dos componentes principales que además cubren un buen porcentaje de la varianza.
+
+Se analiza en más detalle los agrupamientos por pares de atributos para caracterizar los 3 clústers:
+
+```{r echo=FALSE, out.width="50%", out.show="hold"}
+data_scaled$cluster <- as.factor(km$cluster)
+data_long <- gather(data_scaled, key = "Attribute", value = "Value", -cluster)
+ggplot(data_long, aes(x = Value, fill = factor(cluster))) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~ Attribute, ncol = 4, scales = "free") +
+  labs(title = "Density Distribution by Cluster",
+       x = "Value",
+       y = "Density",
+       fill = "Cluster") +
+  theme_minimal()
+```
+
+
+
