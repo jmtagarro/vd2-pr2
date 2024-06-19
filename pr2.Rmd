@@ -296,7 +296,7 @@ to_remove <- c(
     "timezone", "modification_date")
 data <- merged_df[, !(names(merged_df) %in% to_remove)]
 data <- data[!duplicated(data$ref), ]
-data$location <- NULL
+#data$location <- NULL
 #data$ref <- NULL
 ```
 
@@ -313,26 +313,118 @@ Eliminamos la referencia:
 data$ref <- NULL
 ```
 
-# Análisis de los datos
+Elimininamos las propiedades de ultralujo, que superan los 10.000.000
 
-
-
-Se aprecia una buena separación entre los centros de los clústeres en esta visualización de sus dos componentes principales que además cubren un buen porcentaje de la varianza.
-
-Se analiza en más detalle los agrupamientos por pares de atributos para caracterizar los 3 clústers:
-
-```{r echo=FALSE, out.width="50%", out.show="hold"}
-data_scaled$cluster <- as.factor(km$cluster)
-data_long <- gather(data_scaled, key = "Attribute", value = "Value", -cluster)
-ggplot(data_long, aes(x = Value, fill = factor(cluster))) +
-  geom_density(alpha = 0.4) +
-  facet_wrap(~ Attribute, ncol = 4, scales = "free") +
-  labs(title = "Density Distribution by Cluster",
-       x = "Value",
-       y = "Density",
-       fill = "Cluster") +
-  theme_minimal()
+```{r}
+data <- data[data$price < 1000000, ]
+data_orig <- data
 ```
 
+Añadimos el precio por metro cuadrado:
+
+```{r}
+data$price_sqm <- data$price / data$built_area
+```
+
+# Generación de datos para visualizaciones
+
+## Mapa de precios
+
+Cargamos el nomenclator para añadir el identificador del mapa geoJSON del IGN:
+
+```{r}
+municipios <- read.csv("../municipios.csv")
+data <- merge(data, municipios, by.x="location", by.y="NAMEUNIT")
+data <- subset(data, CODNUT3 %in% c("ES612", "ES617"))
+
+data_low <- data[data$price < 300000, ]
+data_hi <- data[data$price >= 300000, ]
+
+data_low_avg <- data_low %>%
+  group_by(NATCODE) %>%
+  summarize(avg_price = n())
+
+data_hi_avg <- data_hi %>%
+  group_by(NATCODE) %>%
+  summarize(avg_price = n())
+
+data_low_with_avg <- data_low %>%
+  left_join(data_low_avg, by = "NATCODE")
+
+data_hi_with_avg <- data_hi %>%
+  left_join(data_hi_avg, by = "NATCODE")
+
+data_low_avg_export <- data_low_with_avg[, c("location", "avg_price", "NATCODE")]
+write.csv(data_low_avg_export, "data_low_avg_export.csv")
+
+data_hi_avg_export <- data_hi_with_avg[, c("location", "avg_price", "NATCODE")]
+write.csv(data_hi_avg_export, "data_hi_avg_export.csv")
+```
+
+## Nube de palabras
+
+```{r}
+data_low_att_long <- data_low %>%
+  separate_longer_delim(description, " ")
+att_counts_low <- data_low_att_long %>%
+  group_by(description) %>%
+  summarize(count = n())
+write.csv(att_counts_low, "att_counts_low.csv")
+
+data_hi_att_long <- data_hi %>%
+  separate_longer_delim(description, " ")
+att_counts_hi <- data_hi_att_long %>%
+  group_by(description) %>%
+  summarize(count = n())
+write.csv(att_counts_low, "att_counts_hi.csv")
+```
+
+## Medias de los atributos numericos
+
+```{r}
+numeric_means <- data_low %>%
+  summarize(across(where(is.numeric), mean, na.rm = TRUE))
+
+# Print the result
+print(numeric_means)
+```
+
+Y para los valores altos:
+
+```{r}
+numeric_means <- data_hi %>%
+  summarize(across(where(is.numeric), mean, na.rm = TRUE))
+
+# Print the result
+print(numeric_means)
+```
+
+## Histograma de precios
+
+```{r}
+options(scipen=999)
+hist_obj <- hist(data_orig$price, plot = FALSE, breaks=10)
+
+# Extract the breakpoints of the bins
+breaks <- hist_obj$breaks
+
+# Extract the counts per bin
+counts <- hist_obj$counts
+
+# Create bin labels
+bin_labels <- paste(head(breaks, -1), breaks[-1], sep = " - ")
+
+# Create a dataframe from the bin labels and counts
+df_bins <- data.frame(
+  bin = bin_labels,
+  count = counts
+)
+
+# Print the dataframe
+print(df_bins)
+
+# Export the dataframe to a CSV file
+write.csv(df_bins, "histogram_bins.csv", row.names = FALSE)
+```
 
 
